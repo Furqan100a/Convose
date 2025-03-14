@@ -11,6 +11,7 @@ import {
   Keyboard,
   ScrollView,
   Alert,
+  Animated,
 } from 'react-native';
 import React, {useState, useEffect, useCallback, useRef} from 'react';
 
@@ -41,6 +42,67 @@ interface Interest {
   secondary_term?: string; // Changed from secondaryName to match API response
   popularity?: number;
 }
+
+// Skeleton loading component for suggestions
+const SkeletonSuggestion = ({index = 0}) => {
+  // Animation value for the skeleton loading effect
+  const opacityValue = useRef(new Animated.Value(0.3)).current;
+
+  // Generate random widths for more realistic appearance
+  const primaryWidth = useRef(70 + Math.random() * 20).current; // 70-90%
+  const secondaryWidth = useRef(40 + Math.random() * 30).current; // 40-70%
+  const hasSecondary = useRef(Math.random() > 0.3).current; // 70% chance to have secondary text
+
+  useEffect(() => {
+    // Create the pulse animation with staggered delay based on index
+    const delay = index * 100; // Stagger the animations by 100ms per item
+
+    const pulseAnimation = Animated.sequence([
+      Animated.timing(opacityValue, {
+        toValue: 0.8,
+        duration: 800,
+        useNativeDriver: true,
+        delay: delay,
+      }),
+      Animated.timing(opacityValue, {
+        toValue: 0.3,
+        duration: 800,
+        useNativeDriver: true,
+      }),
+    ]);
+
+    // Start the infinite animation loop
+    Animated.loop(pulseAnimation).start();
+
+    // Clean up animation when component unmounts
+    return () => {
+      opacityValue.stopAnimation();
+    };
+  }, [opacityValue, index]);
+
+  return (
+    <View style={styles.suggestionItem}>
+      <View style={styles.suggestionContent}>
+        <Animated.View
+          style={[
+            styles.skeletonText,
+            styles.skeletonPrimary,
+            {opacity: opacityValue, width: `${primaryWidth}%`},
+          ]}
+        />
+        {hasSecondary && (
+          <Animated.View
+            style={[
+              styles.skeletonText,
+              styles.skeletonSecondary,
+              {opacity: opacityValue, width: `${secondaryWidth}%`},
+            ]}
+          />
+        )}
+      </View>
+    </View>
+  );
+};
 
 const App = () => {
   const [searchQuery, setSearchQuery] = useState('');
@@ -109,6 +171,56 @@ const App = () => {
         return true;
       }
 
+      // Check if we're just adding characters to the previous query (typing more letters)
+      const lastQuery = lastValidQuery.toLowerCase().trim();
+      if (
+        lastQuery &&
+        normalizedQuery.startsWith(lastQuery) &&
+        lastSearchResults.length > 0
+      ) {
+        // Filter the existing results instead of making a new API call
+        const filteredResults = lastSearchResults.filter(suggestion => {
+          const primaryText = suggestion.name.toLowerCase();
+          const secondaryText = suggestion.secondary_term
+            ? suggestion.secondary_term.toLowerCase()
+            : '';
+
+          // Prioritize startsWith matches for progressive typing
+          const primaryStartsWithMatch =
+            primaryText.startsWith(normalizedQuery);
+          const secondaryStartsWithMatch =
+            secondaryText.startsWith(normalizedQuery);
+
+          // Also include general includes matches as fallback
+          const primaryIncludesMatch = primaryText.includes(normalizedQuery);
+          const secondaryIncludesMatch =
+            secondaryText.includes(normalizedQuery);
+
+          return (
+            primaryStartsWithMatch ||
+            secondaryStartsWithMatch ||
+            primaryIncludesMatch ||
+            secondaryIncludesMatch
+          );
+        });
+
+        if (filteredResults.length > 0) {
+          setSuggestions(filteredResults);
+
+          // Save the filtered results in the cache for future reference
+          setSuggestionsCache(prev => ({
+            ...prev,
+            [normalizedQuery]: filteredResults,
+          }));
+
+          // Update last search results
+          setLastSearchResults(filteredResults);
+          setLastValidQuery(normalizedQuery);
+
+          return true;
+        }
+      }
+
       // Try to filter from existing results for any parent query
       // This is the key to YouTube-like behavior - we check ALL previous queries
       // to see if any can be filtered to match the current query
@@ -119,24 +231,22 @@ const App = () => {
         if (normalizedQuery.startsWith(cachedQuery)) {
           const cachedResults = suggestionsCache[cachedQuery];
           const filteredResults = cachedResults.filter(suggestion => {
-            const primaryStartsWithMatch = suggestion.name
-              .toLowerCase()
-              .startsWith(normalizedQuery);
-            const primaryIncludesMatch = suggestion.name
-              .toLowerCase()
-              .includes(normalizedQuery);
+            const primaryText = suggestion.name.toLowerCase();
+            const secondaryText = suggestion.secondary_term
+              ? suggestion.secondary_term.toLowerCase()
+              : '';
 
+            // Prioritize startsWith matches for progressive typing
+            const primaryStartsWithMatch =
+              primaryText.startsWith(normalizedQuery);
             const secondaryStartsWithMatch =
-              suggestion.secondary_term &&
-              suggestion.secondary_term
-                .toLowerCase()
-                .startsWith(normalizedQuery);
+              secondaryText.startsWith(normalizedQuery);
 
+            // Also include general includes matches as fallback
+            const primaryIncludesMatch = primaryText.includes(normalizedQuery);
             const secondaryIncludesMatch =
-              suggestion.secondary_term &&
-              suggestion.secondary_term.toLowerCase().includes(normalizedQuery);
+              secondaryText.includes(normalizedQuery);
 
-            // Prioritize exact matches and startsWith matches, but also include general substring matches
             return (
               primaryStartsWithMatch ||
               secondaryStartsWithMatch ||
@@ -179,7 +289,73 @@ const App = () => {
 
       // Try filtering locally first (YouTube-like behavior)
       if (filterSuggestionsLocally(query)) {
+        // If local filtering was successful, we don't need to make an API call
+        setLoading(false);
         return;
+      }
+
+      // If we're adding characters to the last query but no local results,
+      // check if we should still make an API call or just use empty results
+      const normalizedQuery = query.toLowerCase().trim();
+      const lastQuery = lastValidQuery.toLowerCase().trim();
+
+      if (
+        lastQuery &&
+        normalizedQuery.startsWith(lastQuery) &&
+        lastSearchResults.length === 0 &&
+        // Only skip API call if we've recently tried a similar query
+        Object.keys(suggestionsCache).some(
+          cachedQuery =>
+            normalizedQuery.startsWith(cachedQuery) &&
+            suggestionsCache[cachedQuery].length === 0 &&
+            normalizedQuery.length <= cachedQuery.length + 3,
+        ) // Within 3 characters
+      ) {
+        // If the last query with same prefix returned no results, likely this won't either
+        // This prevents constant API calls when typing characters that won't match
+        setSuggestions([]);
+        setLoading(false);
+        return;
+      }
+
+      // Check if we already have a superset of results that we can filter from
+      // For example, if we have results for "t" and now typing "tr", we can filter locally
+      const possibleParentQueries = Object.keys(suggestionsCache)
+        .filter(cachedQuery => normalizedQuery.startsWith(cachedQuery))
+        .sort((a, b) => b.length - a.length); // Sort by length descending to get closest match
+
+      if (possibleParentQueries.length > 0) {
+        const closestParentQuery = possibleParentQueries[0];
+        const parentResults = suggestionsCache[closestParentQuery];
+
+        if (parentResults.length > 0) {
+          // Try to filter from parent results first before making an API call
+          const filteredResults = parentResults.filter(suggestion => {
+            const primaryText = suggestion.name.toLowerCase();
+            const secondaryText = suggestion.secondary_term
+              ? suggestion.secondary_term.toLowerCase()
+              : '';
+
+            return (
+              primaryText.startsWith(normalizedQuery) ||
+              secondaryText.startsWith(normalizedQuery) ||
+              primaryText.includes(normalizedQuery) ||
+              secondaryText.includes(normalizedQuery)
+            );
+          });
+
+          if (filteredResults.length > 0) {
+            setSuggestions(filteredResults);
+            setSuggestionsCache(prev => ({
+              ...prev,
+              [normalizedQuery]: filteredResults,
+            }));
+            setLastSearchResults(filteredResults);
+            setLastValidQuery(normalizedQuery);
+            setLoading(false);
+            return;
+          }
+        }
       }
 
       setLoading(true);
@@ -210,9 +386,6 @@ const App = () => {
 
         const data = await response.json();
 
-        // Log the response to debug
-        console.log('API Response:', JSON.stringify(data, null, 2));
-
         // Ensure we're handling the response correctly
         if (!data.autocomplete || !Array.isArray(data.autocomplete)) {
           console.error('Unexpected API response format:', data);
@@ -242,14 +415,26 @@ const App = () => {
         );
 
         // Cache results with the normalized query
-        const normalizedQuery = query.toLowerCase().trim();
         setSuggestionsCache(prev => ({
           ...prev,
           [normalizedQuery]: filteredSuggestions || [],
         }));
 
         setSuggestions(filteredSuggestions || []);
-        setAllFetchedSuggestions(prev => [...prev, ...filteredSuggestions]);
+        setAllFetchedSuggestions(prev => {
+          // Avoid duplicates
+          const newSuggestions = filteredSuggestions.filter(
+            (newItem: Interest) =>
+              !prev.some(
+                existingItem =>
+                  (existingItem.id &&
+                    newItem.id &&
+                    existingItem.id === newItem.id) ||
+                  existingItem.name === newItem.name,
+              ),
+          );
+          return [...prev, ...newSuggestions];
+        });
 
         // Save these as the last search results if we have results
         if (filteredSuggestions.length > 0) {
@@ -266,7 +451,13 @@ const App = () => {
         setLoading(false);
       }
     },
-    [selectedInterests, filterSuggestionsLocally, lastSearchResults],
+    [
+      selectedInterests,
+      filterSuggestionsLocally,
+      lastSearchResults,
+      lastValidQuery,
+      suggestionsCache,
+    ],
   );
 
   // Preload common single letters for instant results
@@ -314,6 +505,22 @@ const App = () => {
                       ),
                   );
 
+                  // Add to all fetched suggestions for better caching
+                  setAllFetchedSuggestions(prev => {
+                    // Avoid duplicates
+                    const newSuggestions = filteredSuggestions.filter(
+                      (newItem: Interest) =>
+                        !prev.some(
+                          existingItem =>
+                            (existingItem.id &&
+                              newItem.id &&
+                              existingItem.id === newItem.id) ||
+                            existingItem.name === newItem.name,
+                        ),
+                    );
+                    return [...prev, ...newSuggestions];
+                  });
+
                   setSuggestionsCache(prev => ({
                     ...prev,
                     [letter]: filteredSuggestions || [],
@@ -348,11 +555,41 @@ const App = () => {
       clearTimeout(searchTimeoutRef.current);
     }
 
+    // If we're just adding more characters to the previous query, check if we can immediately filter
+    const normalizedQuery = searchQuery.toLowerCase().trim();
+    const lastQuery = lastValidQuery.toLowerCase().trim();
+
+    // Immediate local filtering for continued typing (without waiting for debounce)
+    if (
+      lastQuery &&
+      normalizedQuery.startsWith(lastQuery) &&
+      lastSearchResults.length > 0
+    ) {
+      // Try immediate local filtering
+      if (filterSuggestionsLocally(searchQuery)) {
+        // If we got results from local filtering, we don't need an API call
+        // Only set up a timeout for API call if we're typing a completely new query
+        if (normalizedQuery.length > lastQuery.length + 2) {
+          // Only make an API call if we've added more than 2 characters (to reduce API load)
+          return;
+        }
+      }
+    }
+
     // Use a shorter delay for single letters to improve responsiveness
-    const delay = searchQuery.length <= 1 ? 100 : 300;
+    // Use a longer delay when we're continuing to type (adding characters)
+    const delay =
+      searchQuery.length <= 1
+        ? 100
+        : lastQuery && normalizedQuery.startsWith(lastQuery)
+        ? 800 // Increased delay for continued typing to prioritize local filtering
+        : 300;
 
     searchTimeoutRef.current = setTimeout(() => {
-      fetchSuggestions(searchQuery);
+      // Double-check if we can filter locally before making an API call
+      if (!filterSuggestionsLocally(searchQuery)) {
+        fetchSuggestions(searchQuery);
+      }
     }, delay);
 
     return () => {
@@ -360,7 +597,13 @@ const App = () => {
         clearTimeout(searchTimeoutRef.current);
       }
     };
-  }, [searchQuery, fetchSuggestions]);
+  }, [
+    searchQuery,
+    fetchSuggestions,
+    filterSuggestionsLocally,
+    lastValidQuery,
+    lastSearchResults,
+  ]);
 
   const handleSelectSuggestion = (suggestion: Interest) => {
     setSelectedInterests(prev => [...prev, suggestion]);
@@ -418,20 +661,41 @@ const App = () => {
       const normalizedQuery = searchQuery.toLowerCase().trim();
       const normalizedText = text.toLowerCase();
 
-      if (!normalizedText.includes(normalizedQuery)) return text;
+      // Check for exact match first (case insensitive)
+      if (normalizedText === normalizedQuery) {
+        return <Text style={styles.highlightedText}>{text}</Text>;
+      }
 
-      const startIndex = normalizedText.indexOf(normalizedQuery);
-      const endIndex = startIndex + normalizedQuery.length;
+      // Check for startsWith match (prioritize this for progressive typing)
+      if (normalizedText.startsWith(normalizedQuery)) {
+        return (
+          <>
+            <Text style={styles.highlightedText}>
+              {text.substring(0, normalizedQuery.length)}
+            </Text>
+            {text.substring(normalizedQuery.length)}
+          </>
+        );
+      }
 
-      return (
-        <>
-          {text.substring(0, startIndex)}
-          <Text style={styles.highlightedText}>
-            {text.substring(startIndex, endIndex)}
-          </Text>
-          {text.substring(endIndex)}
-        </>
-      );
+      // Check for includes match
+      if (normalizedText.includes(normalizedQuery)) {
+        const startIndex = normalizedText.indexOf(normalizedQuery);
+        const endIndex = startIndex + normalizedQuery.length;
+
+        return (
+          <>
+            {text.substring(0, startIndex)}
+            <Text style={styles.highlightedText}>
+              {text.substring(startIndex, endIndex)}
+            </Text>
+            {text.substring(endIndex)}
+          </>
+        );
+      }
+
+      // No match found
+      return text;
     };
 
     const nameParts = splitInterestNameAndLocation(
@@ -573,7 +837,20 @@ const App = () => {
             </View>
           )}
 
-          {suggestions.length > 0 && (
+          {loading && searchQuery.trim() !== '' && (
+            <View style={styles.suggestionsContainer}>
+              <FlatList
+                data={Array(8).fill(null)}
+                keyExtractor={(_, index) => `skeleton-${index}`}
+                renderItem={({index}) => <SkeletonSuggestion index={index} />}
+                ItemSeparatorComponent={() => <View style={styles.separator} />}
+                inverted={true}
+                keyboardShouldPersistTaps="always"
+              />
+            </View>
+          )}
+
+          {!loading && suggestions.length > 0 && (
             <View style={styles.suggestionsContainer}>
               <FlatList
                 data={suggestions}
@@ -585,13 +862,22 @@ const App = () => {
                 inverted={true}
                 keyboardShouldPersistTaps="always"
                 removeClippedSubviews={false}
+                initialNumToRender={10}
+                maxToRenderPerBatch={10}
+                windowSize={5}
+                updateCellsBatchingPeriod={50}
+                getItemLayout={(data, index) => ({
+                  length: 60, // Approximate height of each item
+                  offset: 60 * index,
+                  index,
+                })}
               />
             </View>
           )}
 
-          {suggestions.length === 0 &&
-            searchQuery.trim() !== '' &&
-            !loading && (
+          {!loading &&
+            suggestions.length === 0 &&
+            searchQuery.trim() !== '' && (
               <View style={styles.createCustomContainer}>
                 <Text style={styles.createCustomText}>
                   No matches found for "{searchQuery}"
@@ -876,5 +1162,19 @@ const styles = StyleSheet.create({
     fontWeight: 'normal',
     fontSize: 12,
     fontStyle: 'italic',
+  },
+  skeletonText: {
+    borderRadius: 4,
+    backgroundColor: '#f0f0f0',
+  },
+  skeletonPrimary: {
+    height: 18,
+    width: '80%',
+    marginBottom: 8,
+  },
+  skeletonSecondary: {
+    height: 14,
+    width: '60%',
+    backgroundColor: '#e0e0e0',
   },
 });
